@@ -6,13 +6,18 @@ from telegram.ext import (
     CallbackQueryHandler,
     CallbackContext,
     MessageHandler,
-    filters
+    filters,
+    ConversationHandler
 )
-import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import os
+from dotenv import load_dotenv
+import pandas as pd
+
+# Load environment variables
+load_dotenv()
 
 # Setup logging
 logging.basicConfig(
@@ -21,30 +26,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# File untuk menyimpan data
-DATA_FILE = 'expense_data.csv'
+# Conversation states
+GET_USERNAME = 1
 
 # Konfigurasi Google Sheets
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDS = ServiceAccountCredentials.from_json_keyfile_name("google-sheets-key.json", SCOPE)
-SHEET_ID = "1U-gDjDYfOmRN15OTRyggQ5Qff55IbqklqrtfakLPnVE"  # Ganti dengan ID spreadsheet Anda
-SHEET_NAME = "Sheet1"       # Ganti jika nama sheet berbeda
-
-# Inisialisasi file CSV jika belum ada
-if not os.path.exists(DATA_FILE):
-    df = pd.DataFrame(columns=['Tanggal', 'Jumlah', 'Keterangan'])
-    df.to_csv(DATA_FILE, index=False)
+CREDS = ServiceAccountCredentials.from_json_keyfile_dict({
+    "type": os.getenv("GS_TYPE"),
+    "project_id": os.getenv("GS_PROJECT_ID"),
+    "private_key_id": os.getenv("GS_PRIVATE_KEY_ID"),
+    "private_key": os.getenv("GS_PRIVATE_KEY").replace('\\n', '\n'),
+    "client_email": os.getenv("GS_CLIENT_EMAIL"),
+    "client_id": os.getenv("GS_CLIENT_ID"),
+    "auth_uri": os.getenv("GS_AUTH_URI"),
+    "token_uri": os.getenv("GS_TOKEN_URI"),
+    "auth_provider_x509_cert_url": os.getenv("GS_AUTH_PROVIDER_CERT_URL"),
+    "client_x509_cert_url": os.getenv("GS_CLIENT_CERT_URL")
+}, SCOPE)
+SHEET_ID = os.getenv("SHEET_ID")  # Get from environment variables
+SHEET_NAME = "Sheet1"  # Ganti jika nama sheet berbeda
 
 # Command handlers
-async def start(update: Update, context: CallbackContext) -> None:
+async def start(update: Update, context: CallbackContext) -> int:
     user = update.effective_user
     await update.message.reply_text(
         f"Halo {user.first_name}! Saya adalah bot pencatat pengeluaran makan harian.\n\n"
+        "Sebelum mulai, silakan masukkan username Anda:"
+    )
+    return GET_USERNAME
+
+async def get_username(update: Update, context: CallbackContext) -> int:
+    username = update.message.text
+    context.user_data['username'] = username
+    await update.message.reply_text(
+        f"Username '{username}' berhasil disimpan!\n\n"
         "Gunakan /catat untuk menambahkan pengeluaran makan hari ini.\n"
         "Gunakan /laporan untuk melihat laporan pengeluaran."
     )
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: CallbackContext) -> int:
+    await update.message.reply_text('Operasi dibatalkan.')
+    return ConversationHandler.END
 
 async def catat_expense(update: Update, context: CallbackContext) -> None:
+    if 'username' not in context.user_data:
+        await update.message.reply_text("Silakan set username Anda terlebih dahulu dengan /start")
+        return
+    
     keyboard = [
         [InlineKeyboardButton("Sarapan", callback_data='Sarapan')],
         [InlineKeyboardButton("Makan Siang", callback_data='Makan Siang')],
@@ -64,13 +93,18 @@ async def button_handler(update: Update, context: CallbackContext) -> None:
     await query.edit_message_text(text=f"Jenis: {query.data}\nSilakan kirim jumlah pengeluaran (contoh: 25000)")
 
 async def save_expense(update: Update, context: CallbackContext):
+    if 'username' not in context.user_data:
+        await update.message.reply_text("Silakan set username Anda terlebih dahulu dengan /start")
+        return
+    
     try:
         jumlah = float(update.message.text)
         jenis_makanan = context.user_data.get('jenis_makanan', 'Lainnya')
         tanggal = datetime.now().strftime('%Y-%m-%d')
+        username = context.user_data['username']
         
         # Simpan ke Google Sheets
-        save_to_sheets(tanggal, jumlah, jenis_makanan)
+        save_to_sheets(tanggal, jumlah, jenis_makanan, username)
         
         await update.message.reply_text(f"✅ Pengeluaran {jenis_makanan} sebesar Rp{jumlah:,} berhasil dicatat di Google Sheets!")
         
@@ -78,14 +112,29 @@ async def save_expense(update: Update, context: CallbackContext):
         await update.message.reply_text("Format jumlah tidak valid. Silakan masukkan angka (contoh: 25000)")
 
 async def laporan(update: Update, context: CallbackContext) -> None:
+    if 'username' not in context.user_data:
+        await update.message.reply_text("Silakan set username Anda terlebih dahulu dengan /start")
+        return
+    
     try:
-        df = pd.read_csv(DATA_FILE)
+        username = context.user_data['username']
+        client = gspread.authorize(CREDS)
+        sheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        records = sheet.get_all_records()
         
-        if df.empty:
+        if not records:
             await update.message.reply_text("Belum ada data pengeluaran yang tercatat.")
             return
             
-        # Konversi kolom Tanggal ke datetime
+        # Filter data untuk user ini
+        user_data = [row for row in records if row['User'] == username]
+        
+        if not user_data:
+            await update.message.reply_text("Belum ada data pengeluaran yang tercatat untuk user Anda.")
+            return
+            
+        # Konversi ke dataframe untuk pengolahan lebih mudah
+        df = pd.DataFrame(user_data)
         df['Tanggal'] = pd.to_datetime(df['Tanggal'])
         
         # Laporan hari ini
@@ -97,14 +146,16 @@ async def laporan(update: Update, context: CallbackContext) -> None:
         month_expenses = df[df['Tanggal'].dt.strftime('%Y-%m') == current_month]
         
         # Format pesan
-        message = "📊 Laporan Pengeluaran Makan\n\n"
+        message = f"📊 Laporan Pengeluaran Makan untuk {username}\n\n"
         message += f"📅 Hari ini ({today}):\n"
         message += f"Total: Rp{today_expenses['Jumlah'].sum():,}\n"
-        message += f"Rata-rata: Rp{today_expenses['Jumlah'].mean():,.0f}\n\n"
+        if not today_expenses.empty:
+            message += f"Rata-rata: Rp{today_expenses['Jumlah'].mean():,.0f}\n\n"
         
         message += f"📅 Bulan ini ({current_month}):\n"
         message += f"Total: Rp{month_expenses['Jumlah'].sum():,}\n"
-        message += f"Rata-rata per hari: Rp{month_expenses.groupby('Tanggal')['Jumlah'].sum().mean():,.0f}\n\n"
+        if not month_expenses.empty:
+            message += f"Rata-rata per hari: Rp{month_expenses.groupby('Tanggal')['Jumlah'].sum().mean():,.0f}\n\n"
         
         # 5 pengeluaran terakhir
         message += "📝 5 Catatan Terakhir:\n"
@@ -122,23 +173,41 @@ async def error_handler(update: object, context: CallbackContext) -> None:
     if isinstance(update, Update) and update.message:
         await update.message.reply_text('Maaf, terjadi error. Silakan coba lagi.')
 
-def save_to_sheets(tanggal, jumlah, keterangan):
+def save_to_sheets(tanggal, jumlah, keterangan, username):
     try:
         client = gspread.authorize(CREDS)
         sheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-        sheet.append_row([tanggal, jumlah, keterangan])
+        
+        # Check if header exists, if not create it
+        if not sheet.get_all_records():
+            sheet.append_row(['Tanggal', 'Jumlah', 'Keterangan', 'User'])
+            
+        sheet.append_row([tanggal, jumlah, keterangan, username])
     except Exception as e:
         logger.error(f"Gagal menyimpan ke Google Sheets: {e}")
 
 def main() -> None:
-    # Ganti dengan token bot Anda
-    TOKEN = "7645553562:AAHU60kWa1Jy2zw9osl26OGpSSVWauZ1elU"
+    # Get token from environment variables
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    
+    if not TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables")
+        return
     
     # Buat Application dan tambahkan handlers
     application = Application.builder().token(TOKEN).build()
 
+    # Add conversation handler for username setup
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            GET_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_username)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     # Register handlers
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(conv_handler)
     application.add_handler(CommandHandler("catat", catat_expense))
     application.add_handler(CommandHandler("laporan", laporan))
     application.add_handler(CallbackQueryHandler(button_handler))
