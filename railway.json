@@ -1,0 +1,9 @@
+{
+    "build": {
+      "nixpacks": {
+        "config": {
+          "install": "pip install --only-binary=:all: -r requirements.txt"
+        }
+      }
+    }
+  }
