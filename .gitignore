@@ -1,2 +1,5 @@
 .env
 google-sheets-key.json
+*.pyc
+__pycache__
+/venv
