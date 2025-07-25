@@ -2,7 +2,8 @@
     "build": {
       "nixpacks": {
         "config": {
-          "install": "pip install --upgrade pip && pip install --only-binary=:all: -r requirements.txt"
+          "install": "cat requirements.txt && pip install --upgrade pip && pip install --only-binary=:all: -r requirements.txt",
+          "pythonVersion": "3.12"
         }
       }
     }
